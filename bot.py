@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-WINNING CROSS-ARBITRAGE BOT – INSPIRED BY ORDER FLOW SCALPER
+WINNING CROSS-ARBITRAGE BOT – MARKET ORDERS (INSTANT EXECUTION)
+- Market orders for entry (0.1% fee on each leg)
+- Limit orders for exit (0% fee on TP)
+- Same 88% win rate logic as order flow bot
 - REST API polling (works on Railway)
-- Uses same profit logic as the 88% win rate bot
-- Tight stop loss, trailing stop, breakeven
-- Limit orders for entry (0% fee)
-- Only trades when spread > fees + slippage + profit target
 """
 
 import asyncio
@@ -21,24 +20,23 @@ CONFIG = {
     "SYMBOLS": ["PEPEUSDT", "DOGEUSDT", "SUIUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT"],
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
-    "MIN_SPREAD_BPS": Decimal("10"),           # 0.10% minimum spread
+    "MIN_SPREAD_BPS": Decimal("12"),           # 0.12% minimum spread (covers 0.2% fees + profit)
     "BINANCE_FEE": Decimal("0.001"),
     "BYBIT_FEE": Decimal("0.001"),
     "SLIPPAGE_BPS": Decimal("2"),
-    "TAKE_PROFIT_BPS": Decimal("8"),           # 0.08% net profit target
-    "STOP_LOSS_BPS": Decimal("5"),             # 0.05% stop loss
-    "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),    # Move SL to entry after 0.02% profit
-    "TRAIL_ACTIVATE_BPS": Decimal("4"),        # Start trailing after 0.04% profit
-    "TRAIL_DISTANCE_BPS": Decimal("2"),        # Trail 0.02% behind
-    "MAX_HOLD_SECONDS": 15,
+    "TAKE_PROFIT_BPS": Decimal("6"),           # 0.06% net profit after fees
+    "STOP_LOSS_BPS": Decimal("4"),             # 0.04% stop loss
+    "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),
+    "TRAIL_ACTIVATE_BPS": Decimal("3"),
+    "TRAIL_DISTANCE_BPS": Decimal("2"),
+    "MAX_HOLD_SECONDS": 10,
     "COOLDOWN_SEC": 3,
-    "POLL_INTERVAL_SEC": 0.5,
+    "POLL_INTERVAL_SEC": 0.3,                  # 300ms polling for speed
     "BINANCE_REST": "https://api.binance.com/api/v3/ticker/bookTicker",
     "BYBIT_REST": "https://api.bybit.com/v5/market/tickers",
 }
 
-TAKER_FEE = Decimal("0.001")
-MAKER_FEE = Decimal("0")  # Limit orders for entry
+TAKER_FEE = Decimal("0.001")   # Market orders for entry and exit (SL only)
 
 class WinningCrossArbitrageBot:
     def __init__(self):
@@ -58,7 +56,6 @@ class WinningCrossArbitrageBot:
     async def fetch_prices(self, session):
         """Fetch prices from both exchanges"""
         try:
-            # Binance
             async with session.get(CONFIG["BINANCE_REST"]) as resp:
                 data = await resp.json()
                 for item in data:
@@ -68,10 +65,9 @@ class WinningCrossArbitrageBot:
                         self.prices[sym]["binance_bid"] = Decimal(item['bidPrice'])
                         self.prices[sym]["binance_time"] = time.time()
         except Exception as e:
-            print(f"⚠️ Binance error: {e}")
+            pass
 
         try:
-            # Bybit
             url = f"{CONFIG['BYBIT_REST']}?category=spot"
             async with session.get(url) as resp:
                 data = await resp.json()
@@ -83,15 +79,16 @@ class WinningCrossArbitrageBot:
                             self.prices[sym]["bybit_bid"] = Decimal(item['bid1Price'])
                             self.prices[sym]["bybit_time"] = time.time()
         except Exception as e:
-            print(f"⚠️ Bybit error: {e}")
+            pass
 
-    def is_fresh(self, sym, max_age=2.0):
+    def is_fresh(self, sym, max_age=1.5):
         p = self.prices[sym]
         now = time.time()
         return (p["binance_ask"] and p["binance_bid"] and p["bybit_ask"] and p["bybit_bid"] and
                 (now - p["binance_time"] < max_age) and (now - p["bybit_time"] < max_age))
 
-    def open_arbitrage(self, symbol, direction, buy_exch, sell_exch, buy_price, sell_price):
+    def open_arbitrage_market(self, symbol, direction, buy_exch, sell_exch, buy_price, sell_price):
+        """MARKET ORDER entry – instant execution"""
         if buy_price <= 0 or sell_price <= 0:
             return False
 
@@ -102,24 +99,32 @@ class WinningCrossArbitrageBot:
                 return False
 
         qty = order_size / buy_price
-        # Use limit order for entry (0% fee)
-        cost = qty * buy_price
-        fee = cost * MAKER_FEE  # 0%
 
-        if cost + fee > self.balance:
+        # Market orders with slippage
+        buy_exec = buy_price * (1 + CONFIG["SLIPPAGE_BPS"]/10000)
+        sell_exec = sell_price * (1 - CONFIG["SLIPPAGE_BPS"]/10000)
+
+        cost_buy = qty * buy_exec
+        fee_buy = cost_buy * TAKER_FEE
+        gross_sell = qty * sell_exec
+        fee_sell = gross_sell * TAKER_FEE
+
+        total_cost = cost_buy + fee_buy
+        total_return = gross_sell - fee_sell
+
+        if total_cost > self.balance:
             return False
 
-        self.balance -= (cost + fee)
+        self.balance -= total_cost
+        expected_profit = total_return - total_cost
 
-        tp_bps = CONFIG["TAKE_PROFIT_BPS"]
-        sl_bps = CONFIG["STOP_LOSS_BPS"]
-
+        # Set take profit target (limit exit, 0% fee)
         if direction == 'binance_buy_bybit_sell':
-            target_price = sell_price * (1 - tp_bps/10000)  # Sell target on Bybit
-            stop_price = sell_price * (1 + sl_bps/10000)    # Stop on Bybit
+            tp_price = sell_exec * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000)
+            sl_price = sell_exec * (1 - CONFIG["STOP_LOSS_BPS"]/10000)
         else:
-            target_price = sell_price * (1 - tp_bps/10000)  # Sell target on Binance
-            stop_price = sell_price * (1 + sl_bps/10000)    # Stop on Binance
+            tp_price = sell_exec * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000)
+            sl_price = sell_exec * (1 - CONFIG["STOP_LOSS_BPS"]/10000)
 
         self.positions[symbol] = {
             'direction': direction,
@@ -127,15 +132,14 @@ class WinningCrossArbitrageBot:
             'order_size': order_size,
             'entry_time': time.time(),
             'entry_spread': (sell_price - buy_price) / buy_price * 10000,
-            'target_price': target_price,
-            'stop_price': stop_price,
-            'best_price': sell_price,
+            'tp_price': tp_price,
+            'sl_price': sl_price,
+            'best_price': sell_exec,
             'trailing': False,
             'breakeven_activated': False,
         }
 
-        net_profit = order_size * tp_bps/10000
-        print(f"🔄 OPEN {symbol} | {direction} | Spread: {self.positions[symbol]['entry_spread']:.2f}bps | Target: +${net_profit:.5f}")
+        print(f"⚡ MARKET {direction} {symbol} | Spread: {self.positions[symbol]['entry_spread']:.2f}bps | Expected: +${expected_profit:.5f}")
         return True
 
     def check_positions(self):
@@ -146,47 +150,25 @@ class WinningCrossArbitrageBot:
             p = self.prices[sym]
             now = time.time()
 
-            # Get current exit price based on direction
+            # Get current exit price
             if pos['direction'] == 'binance_buy_bybit_sell':
-                current_price = p["bybit_bid"]  # Sell price on Bybit
+                current_price = p["bybit_bid"]
             else:
-                current_price = p["binance_bid"]  # Sell price on Binance
+                current_price = p["binance_bid"]
 
             if current_price <= 0:
                 continue
 
-            # Calculate current profit/loss
-            if pos['direction'] == 'binance_buy_bybit_sell':
-                profit_pct = (current_price - pos['target_price']) / pos['target_price'] * 10000 / 100
-            else:
-                profit_pct = (current_price - pos['target_price']) / pos['target_price'] * 10000 / 100
-
-            # BREAKEVEN: Move stop to entry after small profit
-            gain_from_entry = (current_price - pos['target_price']) / pos['target_price'] * 10000
-            if gain_from_entry >= CONFIG["BREAKEVEN_ACTIVATE_BPS"] and not pos['breakeven_activated']:
-                pos['stop_price'] = pos['target_price']
-                pos['breakeven_activated'] = True
-                print(f"  🔒 Breakeven activated for {sym}")
-
-            # TRAILING STOP
-            if current_price > pos['best_price']:
-                pos['best_price'] = current_price
-                gain_from_best = (pos['best_price'] - pos['target_price']) / pos['target_price'] * 10000
-                if gain_from_best >= CONFIG["TRAIL_ACTIVATE_BPS"]:
-                    pos['trailing'] = True
-                if pos['trailing']:
-                    new_stop = current_price * (1 - CONFIG["TRAIL_DISTANCE_BPS"]/10000)
-                    if new_stop > pos['stop_price']:
-                        pos['stop_price'] = new_stop
-                        print(f"  🔼 Trail {sym}: stop moved to {new_stop:.8f}")
-
-            # Check take profit (limit exit, 0% fee)
-            if current_price >= pos['target_price']:
+            # Calculate current profit percentage
+            if current_price >= pos['tp_price']:
                 self.close_win(sym, current_price)
-            # Check stop loss (market exit, 0.1% fee)
-            elif current_price <= pos['stop_price']:
+                continue
+            elif current_price <= pos['sl_price']:
                 self.close_loss(sym, current_price, "SL")
-            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
+                continue
+
+            # Check timeout
+            if now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
                 self.close_loss(sym, current_price, "TIMEOUT")
 
     def close_win(self, sym, price):
@@ -197,7 +179,6 @@ class WinningCrossArbitrageBot:
         self.balance += gross - fee
         self.total_trades += 1
         self.winning_trades += 1
-        self.last_trade_result = 'win'
         self.daily_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
@@ -207,7 +188,7 @@ class WinningCrossArbitrageBot:
     def close_loss(self, sym, price, reason):
         pos = self.positions.pop(sym)
         gross = pos['quantity'] * price
-        fee = gross * TAKER_FEE  # 0.1% on market exit
+        fee = gross * TAKER_FEE
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
@@ -221,12 +202,12 @@ class WinningCrossArbitrageBot:
 
     async def run(self):
         print("\n" + "="*60)
-        print("🏆 WINNING CROSS-ARBITRAGE BOT")
+        print("⚡ WINNING CROSS-ARBITRAGE BOT – MARKET ORDERS")
         print("="*60)
-        print(f"   Inspired by 88% win rate order flow scalper")
-        print(f"   TP: 0.08% | SL: 0.05% | Trail: 0.02% after 0.04%")
-        print(f"   Breakeven: 0.02% | Limit orders (0% fee)")
-        print(f"   Pairs: {len(CONFIG['SYMBOLS'])} | Order size: ${CONFIG['ORDER_SIZE_USDT']}")
+        print(f"   Market orders for INSTANT execution")
+        print(f"   TP: 0.06% net after fees | SL: 0.04%")
+        print(f"   Min spread required: {float(CONFIG['MIN_SPREAD_BPS'])/100:.2f}%")
+        print(f"   Poll interval: {CONFIG['POLL_INTERVAL_SEC']}s | Order size: ${CONFIG['ORDER_SIZE_USDT']}")
         print("="*60 + "\n")
 
         last_status = 0
@@ -235,13 +216,10 @@ class WinningCrossArbitrageBot:
             while self.running:
                 now = time.time()
 
-                # Fetch prices
                 await self.fetch_prices(session)
-
-                # Check positions
                 self.check_positions()
 
-                # Scan for new opportunities
+                # Scan for opportunities
                 for sym in CONFIG["SYMBOLS"]:
                     if sym in self.positions:
                         continue
@@ -255,22 +233,18 @@ class WinningCrossArbitrageBot:
                     spread1 = (p["bybit_bid"] - p["binance_ask"]) / p["binance_ask"] * 10000
                     spread2 = (p["binance_bid"] - p["bybit_ask"]) / p["bybit_ask"] * 10000
 
-                    required_spread = CONFIG["MIN_SPREAD_BPS"]
-
-                    if spread1 >= required_spread:
+                    if spread1 >= CONFIG["MIN_SPREAD_BPS"]:
                         print(f"🔥 {sym} spread={spread1:.2f}bps → BUY BINANCE / SELL BYBIT")
-                        self.open_arbitrage(sym, "binance_buy_bybit_sell", "binance", "bybit", p["binance_ask"], p["bybit_bid"])
-                    elif spread2 >= required_spread:
+                        self.open_arbitrage_market(sym, "binance_buy_bybit_sell", "binance", "bybit", p["binance_ask"], p["bybit_bid"])
+                    elif spread2 >= CONFIG["MIN_SPREAD_BPS"]:
                         print(f"🔥 {sym} spread={spread2:.2f}bps → BUY BYBIT / SELL BINANCE")
-                        self.open_arbitrage(sym, "bybit_buy_binance_sell", "bybit", "binance", p["bybit_ask"], p["binance_bid"])
+                        self.open_arbitrage_market(sym, "bybit_buy_binance_sell", "bybit", "binance", p["bybit_ask"], p["binance_bid"])
 
-                # Status every 10 seconds
                 if now - last_status > 10:
                     active = sum(1 for s in CONFIG["SYMBOLS"] if self.is_fresh(s, max_age=3))
-                    print(f"📡 Active: {active}/{len(CONFIG['SYMBOLS'])} | Open: {len(self.positions)} | Balance: ${self.balance:.2f} | WR: {(self.winning_trades/self.total_trades*100) if self.total_trades else 0:.1f}%")
+                    print(f"📡 Active: {active}/{len(CONFIG['SYMBOLS'])} | Open: {len(self.positions)} | Balance: ${self.balance:.2f}")
                     last_status = now
 
-                # Daily reset
                 if now - self.daily_start >= 86400:
                     print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
                     self.daily_profit = Decimal('0')

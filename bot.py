@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-CROSS-EXCHANGE ARBITRAGE BOT – WITH AUTO TRADING
+CROSS-EXCHANGE ARBITRAGE BOT – FULL LOGGING + AUTO TRADING
+- Detailed live price logs every 5 seconds (like second bot)
+- Auto executes arbitrage when spread > fees (like first bot)
 - Detects price jumps on Binance
-- Executes arbitrage when spread > fees (10.5bps)
-- Simulated trades (ready for live API)
 """
 
 import asyncio
@@ -30,10 +30,14 @@ CONFIG = {
     "BYBIT_LINEAR_WS": "wss://stream.bybit.com/v5/public/linear",
 }
 
-class AutoArbitrageBot:
+class FullArbitrageBot:
     def __init__(self):
         self.binance_prices = {}
+        self.binance_asks = {}
+        self.binance_bids = {}
         self.bybit_prices = {}
+        self.bybit_asks = {}
+        self.bybit_bids = {}
         self.positions = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
@@ -45,31 +49,37 @@ class AutoArbitrageBot:
         self.last_price_print = 0
 
     async def subscribe_binance_spot(self, symbol):
-        """Binance Spot – bookTicker stream"""
+        """Binance Spot – bookTicker stream (fastest, L1 data)"""
         stream = f"{symbol}@bookTicker"
         url = f"{CONFIG['BINANCE_SPOT_WS']}/{stream}"
         while self.running:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    print(f"✅ Binance Spot {symbol} connected")
                     async for msg in ws:
                         data = json.loads(msg)
                         ask_price = Decimal(data['a'])
                         bid_price = Decimal(data['b'])
                         mid_price = (ask_price + bid_price) / 2
                         
+                        # Store old price for jump detection
                         old_price = self.binance_prices.get(symbol, mid_price)
                         self.binance_prices[symbol] = mid_price
-                        self.binance_asks = ask_price
-                        self.binance_bids = bid_price
+                        self.binance_asks[symbol] = ask_price
+                        self.binance_bids[symbol] = bid_price
                         self.last_binance_time[symbol] = time.time()
                         
                         # Detect price jump
                         if old_price > 0:
                             change_bps = abs(mid_price - old_price) / old_price * 10000
+                            direction = "UP" if mid_price > old_price else "DOWN"
+                            
                             if change_bps >= CONFIG["PRICE_JUMP_BPS"]:
+                                print(f"📈 BINANCE {symbol.upper()}: {old_price:.8f} → {mid_price:.8f} ({direction} {change_bps:.2f}bps)")
+                                # Check arbitrage opportunity
                                 self.check_arbitrage_opportunity(symbol, mid_price)
             except Exception as e:
-                print(f"⚠️ Binance {symbol} error: {e}. Reconnecting...")
+                print(f"⚠️ Binance {symbol} error: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
 
     async def subscribe_bybit_linear(self, symbol):
@@ -79,6 +89,7 @@ class AutoArbitrageBot:
                 async with websockets.connect(CONFIG['BYBIT_LINEAR_WS']) as ws:
                     subscribe_msg = {"op": "subscribe", "args": [f"orderbook.50.{symbol.upper()}"]}
                     await ws.send(json.dumps(subscribe_msg))
+                    print(f"✅ Bybit Linear {symbol.upper()} connected")
                     async for msg in ws:
                         data = json.loads(msg)
                         if 'topic' in data and 'data' in data:
@@ -88,9 +99,11 @@ class AutoArbitrageBot:
                                 best_ask = Decimal(book_data['a'][0][0])
                                 mid_price = (best_bid + best_ask) / 2
                                 self.bybit_prices[symbol] = mid_price
+                                self.bybit_bids[symbol] = best_bid
+                                self.bybit_asks[symbol] = best_ask
                                 self.last_bybit_time[symbol] = time.time()
             except Exception as e:
-                print(f"⚠️ Bybit {symbol} error: {e}. Reconnecting...")
+                print(f"⚠️ Bybit {symbol} error: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
 
     def check_arbitrage_opportunity(self, symbol, binance_price):
@@ -141,7 +154,7 @@ class AutoArbitrageBot:
                 return
 
         qty = order_size / buy_price
-        entry_fee = order_size * Decimal("0.00055")  # Bybit fee approx
+        entry_fee = order_size * Decimal("0.00055")
         total_cost = order_size + entry_fee
 
         if total_cost > self.balance:
@@ -149,7 +162,6 @@ class AutoArbitrageBot:
 
         self.balance -= total_cost
 
-        # Set take profit and stop loss
         tp_bps = CONFIG["TAKE_PROFIT_BPS"]
         sl_bps = CONFIG["STOP_LOSS_BPS"]
         
@@ -193,13 +205,14 @@ class AutoArbitrageBot:
     def close_win(self, sym, price):
         pos = self.positions.pop(sym)
         gross = pos['quantity'] * price
-        fee = gross * Decimal("0.0005")  # Binance fee approx
+        fee = gross * Decimal("0.0005")
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
         self.winning_trades += 1
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         print(f"✅ WIN {sym.upper()} | Profit: ${profit:.5f} | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        self.last_trade_time[sym] = time.time()
 
     def close_loss(self, sym, price, reason):
         pos = self.positions.pop(sym)
@@ -210,6 +223,7 @@ class AutoArbitrageBot:
         self.total_trades += 1
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         print(f"❌ {reason} {sym.upper()} | Profit: ${profit:.5f} | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        self.last_trade_time[sym] = time.time()
 
     async def run(self):
         # Start WebSocket connections
@@ -218,8 +232,11 @@ class AutoArbitrageBot:
             asyncio.create_task(self.subscribe_bybit_linear(sym))
 
         print("\n" + "="*60)
-        print("🚀 AUTO ARBITRAGE BOT – EXECUTING TRADES")
+        print("🚀 FULL ARBITRAGE BOT – DETAILED LOGS + AUTO TRADING")
         print("="*60)
+        print(f"   Binance Spot (bookTicker) – fastest L1 data")
+        print(f"   Bybit Linear (orderbook.50)")
+        print(f"   Price jump threshold: {CONFIG['PRICE_JUMP_BPS']}bps")
         print(f"   Min arbitrage spread: {CONFIG['MIN_ARBITRAGE_BPS']}bps")
         print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']}")
         print("="*60 + "\n")
@@ -227,9 +244,23 @@ class AutoArbitrageBot:
         while self.running:
             now = time.time()
             
-            # Print status every 10 seconds
-            if now - self.last_price_print > 10:
-                print(f"\n📊 STATUS | Balance: ${self.balance:.2f} | Trades: {self.total_trades} | WR: {(self.winning_trades/self.total_trades*100) if self.total_trades else 0:.1f}%")
+            # Print detailed live prices every 5 seconds (like second bot)
+            if now - self.last_price_print > 5:
+                print("\n📊 LIVE PRICES:")
+                for sym in CONFIG["SYMBOLS"]:
+                    binance = self.binance_prices.get(sym, 0)
+                    bybit = self.bybit_prices.get(sym, 0)
+                    binance_age = now - self.last_binance_time.get(sym, now) if sym in self.last_binance_time else 999
+                    bybit_age = now - self.last_bybit_time.get(sym, now) if sym in self.last_bybit_time else 999
+                    
+                    if binance > 0 and bybit > 0:
+                        spread = abs(binance - bybit) / min(binance, bybit) * 10000
+                        print(f"   {sym.upper()}: Bin={binance:.8f} ({binance_age:.1f}s) | Byb={bybit:.8f} ({bybit_age:.1f}s) | Spread={spread:.2f}bps")
+                    else:
+                        print(f"   {sym.upper()}: Bin={binance:.8f} | Byb={bybit:.8f} (waiting for data)")
+                
+                # Also print status summary
+                print(f"\n📊 STATUS | Balance: ${self.balance:.2f} | Trades: {self.total_trades} | WR: {(self.winning_trades/self.total_trades*100) if self.total_trades else 0:.1f}% | Open positions: {len(self.positions)}")
                 self.last_price_print = now
 
             self.check_positions()
@@ -237,6 +268,6 @@ class AutoArbitrageBot:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(AutoArbitrageBot().run())
+        asyncio.run(FullArbitrageBot().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")

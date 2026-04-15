@@ -2,48 +2,49 @@
 # -*- coding: utf-8 -*-
 
 """
-WINNING CROSS-ARBITRAGE BOT – MARKET ORDERS (INSTANT EXECUTION)
-- Market orders for entry (0.1% fee on each leg)
-- Limit orders for exit (0% fee on TP)
-- Same 88% win rate logic as order flow bot
-- REST API polling (works on Railway)
+CROSS-EXCHANGE OFI ARBITRAGE – BINANCE FUTURES → BYBIT LINEAR
+- Monitors Binance Futures order book for OFI
+- Compares prices between both exchanges
+- Only trades when price difference > fees (0.105%)
+- Front-runs Bybit when Binance shows strong OFI
 """
 
 import asyncio
+import json
+import websockets
 import aiohttp
 from decimal import Decimal, getcontext
 import time
+from collections import deque
 
 getcontext().prec = 12
 
 CONFIG = {
-    "SYMBOLS": ["PEPEUSDT", "DOGEUSDT", "SUIUSDT", "SOLUSDT", "ETHUSDT", "BTCUSDT"],
+    "SYMBOLS": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PEPEUSDT", "DOGEUSDT"],
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
-    "MIN_SPREAD_BPS": Decimal("12"),           # 0.12% minimum spread (covers 0.2% fees + profit)
-    "BINANCE_FEE": Decimal("0.001"),
-    "BYBIT_FEE": Decimal("0.001"),
-    "SLIPPAGE_BPS": Decimal("2"),
-    "TAKE_PROFIT_BPS": Decimal("6"),           # 0.06% net profit after fees
-    "STOP_LOSS_BPS": Decimal("4"),             # 0.04% stop loss
-    "BREAKEVEN_ACTIVATE_BPS": Decimal("2"),
-    "TRAIL_ACTIVATE_BPS": Decimal("3"),
-    "TRAIL_DISTANCE_BPS": Decimal("2"),
+    "DEPTH_LEVELS": 10,
+    "OFI_THRESHOLD": Decimal("0.70"),           # Binance OFI threshold
+    "MIN_SPREAD_BPS": Decimal("12"),            # 0.12% minimum price difference
+    "BINANCE_FEE": Decimal("0.0005"),           # 0.05% taker
+    "BYBIT_FEE": Decimal("0.00055"),            # 0.055% taker
+    "TOTAL_FEES_BPS": Decimal("10.5"),          # 0.105% combined
+    "TAKE_PROFIT_BPS": Decimal("8"),            # 0.08% net profit
+    "STOP_LOSS_BPS": Decimal("10"),             # 0.10% stop loss
     "MAX_HOLD_SECONDS": 10,
-    "COOLDOWN_SEC": 3,
-    "POLL_INTERVAL_SEC": 0.3,                  # 300ms polling for speed
-    "BINANCE_REST": "https://api.binance.com/api/v3/ticker/bookTicker",
-    "BYBIT_REST": "https://api.bybit.com/v5/market/tickers",
+    "COOLDOWN_SEC": 5,
+    "MAX_LATENCY_MS": 200,
+    "SCAN_INTERVAL_MS": 50,
+    "BINANCE_FUTURES_WS": "wss://fstream.binance.com/ws",
+    "BYBIT_LINEAR_WS": "wss://stream.bybit.com/v5/public/linear",
 }
 
-TAKER_FEE = Decimal("0.001")   # Market orders for entry and exit (SL only)
-
-class WinningCrossArbitrageBot:
+class CrossExchangeOFIBot:
     def __init__(self):
-        self.prices = {s: {"binance_ask": None, "binance_bid": None,
-                           "bybit_ask": None, "bybit_bid": None,
-                           "binance_time": 0, "bybit_time": 0}
-                       for s in CONFIG["SYMBOLS"]}
+        self.binance_books = {}
+        self.bybit_books = {}
+        self.bybit_prices = {}
+        self.binance_prices = {}
         self.positions = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
@@ -51,44 +52,122 @@ class WinningCrossArbitrageBot:
         self.daily_profit = Decimal('0')
         self.daily_start = time.time()
         self.last_trade_time = {}
+        self.last_binance_time = {}
+        self.last_bybit_time = {}
         self.running = True
 
-    async def fetch_prices(self, session):
-        """Fetch prices from both exchanges"""
-        try:
-            async with session.get(CONFIG["BINANCE_REST"]) as resp:
-                data = await resp.json()
-                for item in data:
-                    sym = item['symbol']
-                    if sym in self.prices:
-                        self.prices[sym]["binance_ask"] = Decimal(item['askPrice'])
-                        self.prices[sym]["binance_bid"] = Decimal(item['bidPrice'])
-                        self.prices[sym]["binance_time"] = time.time()
-        except Exception as e:
-            pass
+    class OrderBook:
+        def __init__(self, symbol):
+            self.symbol = symbol
+            self.bids = {}
+            self.asks = {}
+            self.last_update = 0.0
 
-        try:
-            url = f"{CONFIG['BYBIT_REST']}?category=spot"
-            async with session.get(url) as resp:
-                data = await resp.json()
-                if data.get('retCode') == 0:
-                    for item in data['result']['list']:
-                        sym = item['symbol']
-                        if sym in self.prices:
-                            self.prices[sym]["bybit_ask"] = Decimal(item['ask1Price'])
-                            self.prices[sym]["bybit_bid"] = Decimal(item['bid1Price'])
-                            self.prices[sym]["bybit_time"] = time.time()
-        except Exception as e:
-            pass
+        def apply_snapshot(self, bids, asks):
+            self.bids = {Decimal(p): Decimal(q) for p, q in bids[:20]}
+            self.asks = {Decimal(p): Decimal(q) for p, q in asks[:20]}
+            self.last_update = time.time()
 
-    def is_fresh(self, sym, max_age=1.5):
-        p = self.prices[sym]
-        now = time.time()
-        return (p["binance_ask"] and p["binance_bid"] and p["bybit_ask"] and p["bybit_bid"] and
-                (now - p["binance_time"] < max_age) and (now - p["bybit_time"] < max_age))
+        def apply_delta(self, bids, asks):
+            for price, qty in bids:
+                p, q = Decimal(price), Decimal(qty)
+                if q == 0:
+                    self.bids.pop(p, None)
+                else:
+                    self.bids[p] = q
+            for price, qty in asks:
+                p, q = Decimal(price), Decimal(qty)
+                if q == 0:
+                    self.asks.pop(p, None)
+                else:
+                    self.asks[p] = q
+            self.last_update = time.time()
 
-    def open_arbitrage_market(self, symbol, direction, buy_exch, sell_exch, buy_price, sell_price):
-        """MARKET ORDER entry – instant execution"""
+        def best_bid(self):
+            return max(self.bids.keys()) if self.bids else Decimal('0')
+
+        def best_ask(self):
+            return min(self.asks.keys()) if self.asks else Decimal('0')
+
+        def mid_price(self):
+            bb, ba = self.best_bid(), self.best_ask()
+            return (bb + ba) / 2 if bb and ba else Decimal('0')
+
+        def get_ofi(self, depth=10):
+            sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:depth]
+            sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:depth]
+            bid_vol = sum(q * (depth - i) for i, (_, q) in enumerate(sorted_bids))
+            ask_vol = sum(q * (depth - i) for i, (_, q) in enumerate(sorted_asks))
+            total = bid_vol + ask_vol
+            if total == 0:
+                return Decimal('0')
+            return (bid_vol - ask_vol) / total
+
+    async def subscribe_binance_futures(self, symbol):
+        """Binance Futures WebSocket"""
+        stream = f"{symbol.lower()}@depth20@100ms"
+        url = f"{CONFIG['BINANCE_FUTURES_WS']}/{stream}"
+        while self.running:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                    print(f"✅ Binance Futures {symbol} connected")
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        if symbol not in self.binance_books:
+                            self.binance_books[symbol] = self.OrderBook(symbol)
+                        # Binance sends snapshots and deltas
+                        if 'bids' in data and 'asks' in data:
+                            self.binance_books[symbol].apply_snapshot(data['bids'], data['asks'])
+                        else:
+                            self.binance_books[symbol].apply_delta(data.get('b', []), data.get('a', []))
+                        self.binance_prices[symbol] = self.binance_books[symbol].mid_price()
+                        self.last_binance_time[symbol] = time.time()
+            except Exception as e:
+                print(f"⚠️ Binance {symbol} error: {e}. Reconnecting...")
+                await asyncio.sleep(5)
+
+    async def subscribe_bybit_linear(self, symbol):
+        """Bybit Linear WebSocket"""
+        while self.running:
+            try:
+                async with websockets.connect(CONFIG['BYBIT_LINEAR_WS']) as ws:
+                    subscribe_msg = {"op": "subscribe", "args": [f"orderbook.50.{symbol}"]}
+                    await ws.send(json.dumps(subscribe_msg))
+                    print(f"✅ Bybit Linear {symbol} connected")
+                    async for msg in ws:
+                        data = json.loads(msg)
+                        if 'topic' in data and 'data' in data:
+                            if symbol not in self.bybit_books:
+                                self.bybit_books[symbol] = self.OrderBook(symbol)
+                            book_data = data['data']
+                            if 'b' in book_data and 'a' in book_data:
+                                self.bybit_books[symbol].apply_snapshot(book_data['b'], book_data['a'])
+                                self.bybit_prices[symbol] = self.bybit_books[symbol].mid_price()
+                                self.last_bybit_time[symbol] = time.time()
+            except Exception as e:
+                print(f"⚠️ Bybit {symbol} error: {e}. Reconnecting...")
+                await asyncio.sleep(5)
+
+    def is_fresh(self, symbol, max_age=1.0):
+        """Check if both exchanges have recent data"""
+        binance_ok = symbol in self.last_binance_time and (time.time() - self.last_binance_time[symbol]) < max_age
+        bybit_ok = symbol in self.last_bybit_time and (time.time() - self.last_bybit_time[symbol]) < max_age
+        return binance_ok and bybit_ok
+
+    def check_price_difference(self, symbol):
+        """Calculate price difference between Binance and Bybit"""
+        if symbol not in self.binance_prices or symbol not in self.bybit_prices:
+            return None, None
+        binance_price = self.binance_prices[symbol]
+        bybit_price = self.bybit_prices[symbol]
+        if binance_price <= 0 or bybit_price <= 0:
+            return None, None
+        # Spread in basis points
+        spread_bps = abs(binance_price - bybit_price) / min(binance_price, bybit_price) * 10000
+        return spread_bps, binance_price > bybit_price
+
+    def open_arbitrage(self, symbol, direction, buy_exch, sell_exch, buy_price, sell_price):
+        """Execute arbitrage trade"""
         if buy_price <= 0 or sell_price <= 0:
             return False
 
@@ -99,82 +178,58 @@ class WinningCrossArbitrageBot:
                 return False
 
         qty = order_size / buy_price
+        entry_fee = order_size * CONFIG["BINANCE_FEE"]  # Approximate
 
-        # Market orders with slippage
-        buy_exec = buy_price * (1 + CONFIG["SLIPPAGE_BPS"]/10000)
-        sell_exec = sell_price * (1 - CONFIG["SLIPPAGE_BPS"]/10000)
-
-        cost_buy = qty * buy_exec
-        fee_buy = cost_buy * TAKER_FEE
-        gross_sell = qty * sell_exec
-        fee_sell = gross_sell * TAKER_FEE
-
-        total_cost = cost_buy + fee_buy
-        total_return = gross_sell - fee_sell
-
-        if total_cost > self.balance:
+        if order_size + entry_fee > self.balance:
             return False
 
-        self.balance -= total_cost
-        expected_profit = total_return - total_cost
+        self.balance -= (order_size + entry_fee)
 
-        # Set take profit target (limit exit, 0% fee)
-        if direction == 'binance_buy_bybit_sell':
-            tp_price = sell_exec * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000)
-            sl_price = sell_exec * (1 - CONFIG["STOP_LOSS_BPS"]/10000)
+        tp_bps = CONFIG["TAKE_PROFIT_BPS"]
+        sl_bps = CONFIG["STOP_LOSS_BPS"]
+
+        # For long: buy cheap, sell expensive
+        if direction == 'binance_cheaper':
+            target_price = sell_price * (1 + tp_bps/10000)
+            stop_price = sell_price * (1 - sl_bps/10000)
         else:
-            tp_price = sell_exec * (1 + CONFIG["TAKE_PROFIT_BPS"]/10000)
-            sl_price = sell_exec * (1 - CONFIG["STOP_LOSS_BPS"]/10000)
+            target_price = sell_price * (1 + tp_bps/10000)
+            stop_price = sell_price * (1 - sl_bps/10000)
 
         self.positions[symbol] = {
             'direction': direction,
             'quantity': qty,
             'order_size': order_size,
             'entry_time': time.time(),
-            'entry_spread': (sell_price - buy_price) / buy_price * 10000,
-            'tp_price': tp_price,
-            'sl_price': sl_price,
-            'best_price': sell_exec,
-            'trailing': False,
-            'breakeven_activated': False,
+            'target_price': target_price,
+            'stop_price': stop_price,
         }
 
-        print(f"⚡ MARKET {direction} {symbol} | Spread: {self.positions[symbol]['entry_spread']:.2f}bps | Expected: +${expected_profit:.5f}")
+        net_profit_target = order_size * tp_bps/10000
+        print(f"🔄 ARBITRAGE OPEN {symbol} | {direction} | Spread: {CONFIG['MIN_SPREAD_BPS']:.1f}bps | Target: +${net_profit_target:.5f}")
         return True
 
     def check_positions(self):
         for sym, pos in list(self.positions.items()):
-            if not self.is_fresh(sym):
+            if sym not in self.bybit_prices:
                 continue
-
-            p = self.prices[sym]
-            now = time.time()
-
-            # Get current exit price
-            if pos['direction'] == 'binance_buy_bybit_sell':
-                current_price = p["bybit_bid"]
-            else:
-                current_price = p["binance_bid"]
-
+            current_price = self.bybit_prices[sym]
             if current_price <= 0:
                 continue
 
-            # Calculate current profit percentage
-            if current_price >= pos['tp_price']:
-                self.close_win(sym, current_price)
-                continue
-            elif current_price <= pos['sl_price']:
-                self.close_loss(sym, current_price, "SL")
-                continue
+            now = time.time()
 
-            # Check timeout
-            if now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
+            if current_price >= pos['target_price']:
+                self.close_win(sym, current_price)
+            elif current_price <= pos['stop_price']:
+                self.close_loss(sym, current_price, "SL")
+            elif now - pos['entry_time'] > CONFIG["MAX_HOLD_SECONDS"]:
                 self.close_loss(sym, current_price, "TIMEOUT")
 
     def close_win(self, sym, price):
         pos = self.positions.pop(sym)
         gross = pos['quantity'] * price
-        fee = gross * MAKER_FEE  # 0% on limit exit
+        fee = gross * CONFIG["BYBIT_FEE"]
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
@@ -182,13 +237,13 @@ class WinningCrossArbitrageBot:
         self.daily_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
-        print(f"✅ WIN {sym} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"✅ WIN {sym} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
     def close_loss(self, sym, price, reason):
         pos = self.positions.pop(sym)
         gross = pos['quantity'] * price
-        fee = gross * TAKER_FEE
+        fee = gross * CONFIG["BYBIT_FEE"]
         profit = gross - pos['order_size'] - fee
         self.balance += gross - fee
         self.total_trades += 1
@@ -197,63 +252,85 @@ class WinningCrossArbitrageBot:
         self.daily_profit += profit
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         profit_pct = (profit / pos['order_size'] * 100) if pos['order_size'] > 0 else 0
-        print(f"{'✅' if profit>0 else '❌'} {reason} {sym} | Profit: ${profit:.5f} ({profit_pct:.2f}%) | Balance: ${self.balance:.2f} | WR: {win_rate:.1f}%")
+        print(f"{'✅' if profit>0 else '❌'} {reason} {sym} | ${profit:.5f} ({profit_pct:.2f}%) | Bal: ${self.balance:.2f} | WR: {win_rate:.1f}%")
         self.last_trade_time[sym] = time.time()
 
     async def run(self):
+        # Start WebSocket connections
+        for sym in CONFIG["SYMBOLS"]:
+            asyncio.create_task(self.subscribe_binance_futures(sym))
+            asyncio.create_task(self.subscribe_bybit_linear(sym))
+
         print("\n" + "="*60)
-        print("⚡ WINNING CROSS-ARBITRAGE BOT – MARKET ORDERS")
+        print("🚀 CROSS-EXCHANGE OFI ARBITRAGE – BINANCE → BYBIT")
         print("="*60)
-        print(f"   Market orders for INSTANT execution")
-        print(f"   TP: 0.06% net after fees | SL: 0.04%")
-        print(f"   Min spread required: {float(CONFIG['MIN_SPREAD_BPS'])/100:.2f}%")
-        print(f"   Poll interval: {CONFIG['POLL_INTERVAL_SEC']}s | Order size: ${CONFIG['ORDER_SIZE_USDT']}")
+        print(f"   Monitoring {len(CONFIG['SYMBOLS'])} pairs")
+        print(f"   OFI threshold: {CONFIG['OFI_THRESHOLD']} | Min spread: {CONFIG['MIN_SPREAD_BPS']}bps")
+        print(f"   Total fees: {CONFIG['TOTAL_FEES_BPS']}bps | TP: {CONFIG['TAKE_PROFIT_BPS']}bps net")
         print("="*60 + "\n")
 
         last_status = 0
+        last_ofi_print = 0
 
-        async with aiohttp.ClientSession() as session:
-            while self.running:
-                now = time.time()
+        while self.running:
+            now = time.time()
 
-                await self.fetch_prices(session)
-                self.check_positions()
-
-                # Scan for opportunities
+            # Print OFI and price differences every 5 seconds
+            if now - last_ofi_print > 5:
+                print("\n🔍 MARKET STATUS:")
                 for sym in CONFIG["SYMBOLS"]:
-                    if sym in self.positions:
-                        continue
-                    if sym in self.last_trade_time and now - self.last_trade_time[sym] < CONFIG["COOLDOWN_SEC"]:
-                        continue
+                    if self.is_fresh(sym):
+                        binance_ofi = self.binance_books[sym].get_ofi(CONFIG["DEPTH_LEVELS"]) if sym in self.binance_books else Decimal('0')
+                        spread, binance_higher = self.check_price_difference(sym)
+                        binance_price = self.binance_prices.get(sym, 0)
+                        bybit_price = self.bybit_prices.get(sym, 0)
+                        print(f"   {sym}: Binance OFI={binance_ofi:.2f} | Spread={spread:.1f}bps | Bin={binance_price:.6f} Byb={bybit_price:.6f}")
+                last_ofi_print = now
 
-                    if not self.is_fresh(sym):
-                        continue
+            self.check_positions()
 
-                    p = self.prices[sym]
-                    spread1 = (p["bybit_bid"] - p["binance_ask"]) / p["binance_ask"] * 10000
-                    spread2 = (p["binance_bid"] - p["bybit_ask"]) / p["bybit_ask"] * 10000
+            # Scan for arbitrage opportunities
+            for sym in CONFIG["SYMBOLS"]:
+                if sym in self.positions:
+                    continue
+                if sym in self.last_trade_time and now - self.last_trade_time[sym] < CONFIG["COOLDOWN_SEC"]:
+                    continue
 
-                    if spread1 >= CONFIG["MIN_SPREAD_BPS"]:
-                        print(f"🔥 {sym} spread={spread1:.2f}bps → BUY BINANCE / SELL BYBIT")
-                        self.open_arbitrage_market(sym, "binance_buy_bybit_sell", "binance", "bybit", p["binance_ask"], p["bybit_bid"])
-                    elif spread2 >= CONFIG["MIN_SPREAD_BPS"]:
-                        print(f"🔥 {sym} spread={spread2:.2f}bps → BUY BYBIT / SELL BINANCE")
-                        self.open_arbitrage_market(sym, "bybit_buy_binance_sell", "bybit", "binance", p["bybit_ask"], p["binance_bid"])
+                if not self.is_fresh(sym):
+                    continue
 
-                if now - last_status > 10:
-                    active = sum(1 for s in CONFIG["SYMBOLS"] if self.is_fresh(s, max_age=3))
-                    print(f"📡 Active: {active}/{len(CONFIG['SYMBOLS'])} | Open: {len(self.positions)} | Balance: ${self.balance:.2f}")
-                    last_status = now
+                # Get Binance OFI
+                binance_ofi = self.binance_books[sym].get_ofi(CONFIG["DEPTH_LEVELS"]) if sym in self.binance_books else Decimal('0')
+                
+                # Check price difference
+                spread, binance_higher = self.check_price_difference(sym)
+                
+                if spread is None or spread < CONFIG["MIN_SPREAD_BPS"]:
+                    continue
 
-                if now - self.daily_start >= 86400:
-                    print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
-                    self.daily_profit = Decimal('0')
-                    self.daily_start = now
+                # STRATEGY: Binance OFI > threshold AND price difference > fees
+                if binance_ofi > CONFIG["OFI_THRESHOLD"]:
+                    if binance_higher:
+                        # Binance price is HIGHER than Bybit → buy Bybit (cheaper)
+                        print(f"🔥 OPPORTUNITY {sym}: Binance OFI={binance_ofi:.2f} | Binance price is HIGHER | Spread={spread:.1f}bps → BUY BYBIT, SELL BINANCE")
+                        self.open_arbitrage(sym, 'bybit_cheaper', 'bybit', 'binance', 
+                                           self.bybit_prices[sym], self.binance_prices[sym])
+                    else:
+                        # Binance price is LOWER than Bybit → buy Binance (cheaper)
+                        print(f"🔥 OPPORTUNITY {sym}: Binance OFI={binance_ofi:.2f} | Binance price is LOWER | Spread={spread:.1f}bps → BUY BINANCE, SELL BYBIT")
+                        self.open_arbitrage(sym, 'binance_cheaper', 'binance', 'bybit',
+                                           self.binance_prices[sym], self.bybit_prices[sym])
 
-                await asyncio.sleep(CONFIG["POLL_INTERVAL_SEC"])
+            # Daily reset
+            if now - self.daily_start >= 86400:
+                print(f"\n💰 DAILY PROFIT: +${self.daily_profit:.5f} | Balance: ${self.balance:.2f}\n")
+                self.daily_profit = Decimal('0')
+                self.daily_start = now
+
+            await asyncio.sleep(CONFIG["SCAN_INTERVAL_MS"] / 1000.0)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(WinningCrossArbitrageBot().run())
+        asyncio.run(CrossExchangeOFIBot().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")

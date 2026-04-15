@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-CROSS-EXCHANGE ARBITRAGE BOT – FULL LOGGING + AUTO TRADING
-- Detailed live price logs every 5 seconds (like second bot)
-- Auto executes arbitrage when spread > fees (like first bot)
-- Detects price jumps on Binance
+CROSS-EXCHANGE ARBITRAGE BOT – WITH TIMING METRICS
+- Measures reaction time in milliseconds
+- Shows latency between Binance price change and arbitrage check
+- Optimized for sub-100ms execution
 """
 
 import asyncio
@@ -21,23 +21,19 @@ CONFIG = {
     "ORDER_SIZE_USDT": Decimal("5.00"),
     "INITIAL_BALANCE": Decimal("100.00"),
     "PRICE_JUMP_BPS": Decimal("3"),              # 0.03% jump threshold
-    "MIN_ARBITRAGE_BPS": Decimal("12"),          # 0.12% minimum spread (covers 10.5bps fees + buffer)
-    "TAKE_PROFIT_BPS": Decimal("5"),             # 0.05% net profit target
-    "STOP_LOSS_BPS": Decimal("8"),               # 0.08% stop loss
+    "MIN_ARBITRAGE_BPS": Decimal("12"),          # 0.12% minimum spread
+    "TAKE_PROFIT_BPS": Decimal("5"),
+    "STOP_LOSS_BPS": Decimal("8"),
     "MAX_HOLD_SECONDS": 5,
     "COOLDOWN_SEC": 10,
     "BINANCE_SPOT_WS": "wss://stream.binance.com:9443/ws",
     "BYBIT_LINEAR_WS": "wss://stream.bybit.com/v5/public/linear",
 }
 
-class FullArbitrageBot:
+class FastArbitrageBot:
     def __init__(self):
         self.binance_prices = {}
-        self.binance_asks = {}
-        self.binance_bids = {}
         self.bybit_prices = {}
-        self.bybit_asks = {}
-        self.bybit_bids = {}
         self.positions = {}
         self.balance = CONFIG["INITIAL_BALANCE"]
         self.total_trades = 0
@@ -47,6 +43,8 @@ class FullArbitrageBot:
         self.last_bybit_time = {}
         self.running = True
         self.last_price_print = 0
+        self.price_update_count = 0
+        self.last_update_time = time.time()
 
     async def subscribe_binance_spot(self, symbol):
         """Binance Spot – bookTicker stream (fastest, L1 data)"""
@@ -57,29 +55,33 @@ class FullArbitrageBot:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     print(f"✅ Binance Spot {symbol} connected")
                     async for msg in ws:
+                        # Measure time between updates
+                        self.price_update_count += 1
+                        update_time = time.time()
+                        time_since_last = (update_time - self.last_update_time) * 1000
+                        self.last_update_time = update_time
+                        
                         data = json.loads(msg)
                         ask_price = Decimal(data['a'])
                         bid_price = Decimal(data['b'])
                         mid_price = (ask_price + bid_price) / 2
                         
-                        # Store old price for jump detection
                         old_price = self.binance_prices.get(symbol, mid_price)
                         self.binance_prices[symbol] = mid_price
-                        self.binance_asks[symbol] = ask_price
-                        self.binance_bids[symbol] = bid_price
-                        self.last_binance_time[symbol] = time.time()
+                        self.last_binance_time[symbol] = update_time
                         
-                        # Detect price jump
+                        # Detect price jump with timing
                         if old_price > 0:
                             change_bps = abs(mid_price - old_price) / old_price * 10000
                             direction = "UP" if mid_price > old_price else "DOWN"
                             
                             if change_bps >= CONFIG["PRICE_JUMP_BPS"]:
-                                print(f"📈 BINANCE {symbol.upper()}: {old_price:.8f} → {mid_price:.8f} ({direction} {change_bps:.2f}bps)")
-                                # Check arbitrage opportunity
-                                self.check_arbitrage_opportunity(symbol, mid_price)
+                                reaction_time = (time.time() - update_time) * 1000
+                                print(f"\n📈 BINANCE {symbol.upper()}: {old_price:.8f} → {mid_price:.8f} ({direction} {change_bps:.2f}bps)")
+                                print(f"   ⏱️ Update interval: {time_since_last:.1f}ms | Reaction: {reaction_time:.1f}ms")
+                                await self.check_arbitrage_opportunity(symbol, mid_price, update_time)
             except Exception as e:
-                print(f"⚠️ Binance {symbol} error: {e}. Reconnecting in 5s...")
+                print(f"⚠️ Binance {symbol} error: {e}. Reconnecting...")
                 await asyncio.sleep(5)
 
     async def subscribe_bybit_linear(self, symbol):
@@ -99,15 +101,13 @@ class FullArbitrageBot:
                                 best_ask = Decimal(book_data['a'][0][0])
                                 mid_price = (best_bid + best_ask) / 2
                                 self.bybit_prices[symbol] = mid_price
-                                self.bybit_bids[symbol] = best_bid
-                                self.bybit_asks[symbol] = best_ask
                                 self.last_bybit_time[symbol] = time.time()
             except Exception as e:
-                print(f"⚠️ Bybit {symbol} error: {e}. Reconnecting in 5s...")
+                print(f"⚠️ Bybit {symbol} error: {e}. Reconnecting...")
                 await asyncio.sleep(5)
 
-    def check_arbitrage_opportunity(self, symbol, binance_price):
-        """Check if arbitrage opportunity exists and execute"""
+    async def check_arbitrage_opportunity(self, symbol, binance_price, detection_time):
+        """Check arbitrage with timing metrics"""
         if symbol not in self.bybit_prices:
             return
         if symbol in self.positions:
@@ -122,30 +122,41 @@ class FullArbitrageBot:
         # Calculate spread
         spread_bps = abs(binance_price - bybit_price) / min(binance_price, bybit_price) * 10000
         
-        # Check if spread > minimum required
+        # Calculate data age
+        bybit_age = (detection_time - self.last_bybit_time.get(symbol, detection_time)) * 1000
+        
+        print(f"   🔍 Spread: {spread_bps:.2f}bps | Bybit data age: {bybit_age:.0f}ms | Required: {CONFIG['MIN_ARBITRAGE_BPS']}bps")
+        
         if spread_bps < CONFIG["MIN_ARBITRAGE_BPS"]:
             return
 
+        # Calculate total latency
+        execution_time = time.time()
+        total_latency = (execution_time - detection_time) * 1000
+        
         # Determine direction
         if binance_price > bybit_price:
-            # Binance higher → Buy Bybit, Sell Binance
             print(f"\n🎯 ARBITRAGE OPPORTUNITY on {symbol.upper()}!")
             print(f"   Spread: {spread_bps:.2f}bps > {CONFIG['MIN_ARBITRAGE_BPS']}bps")
-            print(f"   Buy Bybit @ {bybit_price:.8f}")
-            print(f"   Sell Binance @ {binance_price:.8f}")
+            print(f"   Binance: {binance_price:.8f} | Bybit: {bybit_price:.8f}")
+            print(f"   Action: BUY Bybit @ {bybit_price:.8f} | SELL Binance @ {binance_price:.8f}")
             print(f"   Expected profit: ${CONFIG['ORDER_SIZE_USDT'] * (spread_bps - 10.5)/10000:.5f}")
-            self.execute_arbitrage(symbol, 'buy_bybit_sell_binance', bybit_price, binance_price)
+            print(f"   ⏱️ Total latency: {total_latency:.1f}ms (detection→execution)")
+            await self.execute_arbitrage(symbol, 'buy_bybit_sell_binance', bybit_price, binance_price, detection_time)
         else:
-            # Bybit higher → Buy Binance, Sell Bybit
             print(f"\n🎯 ARBITRAGE OPPORTUNITY on {symbol.upper()}!")
             print(f"   Spread: {spread_bps:.2f}bps > {CONFIG['MIN_ARBITRAGE_BPS']}bps")
-            print(f"   Buy Binance @ {binance_price:.8f}")
-            print(f"   Sell Bybit @ {bybit_price:.8f}")
+            print(f"   Binance: {binance_price:.8f} | Bybit: {bybit_price:.8f}")
+            print(f"   Action: BUY Binance @ {binance_price:.8f} | SELL Bybit @ {bybit_price:.8f}")
             print(f"   Expected profit: ${CONFIG['ORDER_SIZE_USDT'] * (spread_bps - 10.5)/10000:.5f}")
-            self.execute_arbitrage(symbol, 'buy_binance_sell_bybit', binance_price, bybit_price)
+            print(f"   ⏱️ Total latency: {total_latency:.1f}ms (detection→execution)")
+            await self.execute_arbitrage(symbol, 'buy_binance_sell_bybit', binance_price, bybit_price, detection_time)
 
-    def execute_arbitrage(self, symbol, direction, buy_price, sell_price):
-        """Execute arbitrage trade (simulated)"""
+    async def execute_arbitrage(self, symbol, direction, buy_price, sell_price, detection_time):
+        """Execute arbitrage trade with timing"""
+        execution_time = time.time()
+        latency = (execution_time - detection_time) * 1000
+        
         order_size = CONFIG["ORDER_SIZE_USDT"]
         if order_size > self.balance:
             order_size = self.balance * Decimal("0.95")
@@ -185,7 +196,7 @@ class FullArbitrageBot:
 
         spread_bps = abs(sell_price - buy_price) / buy_price * 10000
         expected_profit = order_size * (spread_bps - 10.5) / 10000
-        print(f"✅ ARBITRAGE EXECUTED {symbol.upper()} | Expected profit: +${expected_profit:.5f}")
+        print(f"✅ ARBITRAGE EXECUTED {symbol.upper()} | Latency: {latency:.1f}ms | Expected profit: +${expected_profit:.5f}")
         self.last_trade_time[symbol] = time.time()
 
     def check_positions(self):
@@ -232,42 +243,33 @@ class FullArbitrageBot:
             asyncio.create_task(self.subscribe_bybit_linear(sym))
 
         print("\n" + "="*60)
-        print("🚀 FULL ARBITRAGE BOT – DETAILED LOGS + AUTO TRADING")
+        print("🚀 FAST ARBITRAGE BOT – WITH TIMING METRICS")
         print("="*60)
-        print(f"   Binance Spot (bookTicker) – fastest L1 data")
-        print(f"   Bybit Linear (orderbook.50)")
+        print(f"   Binance updates: ~100ms (depth20@100ms)")
         print(f"   Price jump threshold: {CONFIG['PRICE_JUMP_BPS']}bps")
         print(f"   Min arbitrage spread: {CONFIG['MIN_ARBITRAGE_BPS']}bps")
         print(f"   Order size: ${CONFIG['ORDER_SIZE_USDT']}")
         print("="*60 + "\n")
 
+        print("⏱️ TIMING METRICS LEGEND:")
+        print("   Update interval = time between Binance price updates")
+        print("   Bybit data age = how old the Bybit price is")
+        print("   Total latency = detection → execution time")
+        print("="*60 + "\n")
+
         while self.running:
             now = time.time()
             
-            # Print detailed live prices every 5 seconds (like second bot)
-            if now - self.last_price_print > 5:
-                print("\n📊 LIVE PRICES:")
-                for sym in CONFIG["SYMBOLS"]:
-                    binance = self.binance_prices.get(sym, 0)
-                    bybit = self.bybit_prices.get(sym, 0)
-                    binance_age = now - self.last_binance_time.get(sym, now) if sym in self.last_binance_time else 999
-                    bybit_age = now - self.last_bybit_time.get(sym, now) if sym in self.last_bybit_time else 999
-                    
-                    if binance > 0 and bybit > 0:
-                        spread = abs(binance - bybit) / min(binance, bybit) * 10000
-                        print(f"   {sym.upper()}: Bin={binance:.8f} ({binance_age:.1f}s) | Byb={bybit:.8f} ({bybit_age:.1f}s) | Spread={spread:.2f}bps")
-                    else:
-                        print(f"   {sym.upper()}: Bin={binance:.8f} | Byb={bybit:.8f} (waiting for data)")
-                
-                # Also print status summary
-                print(f"\n📊 STATUS | Balance: ${self.balance:.2f} | Trades: {self.total_trades} | WR: {(self.winning_trades/self.total_trades*100) if self.total_trades else 0:.1f}% | Open positions: {len(self.positions)}")
+            if now - self.last_price_print > 10:
+                print(f"\n📊 STATUS | Balance: ${self.balance:.2f} | Trades: {self.total_trades} | WR: {(self.winning_trades/self.total_trades*100) if self.total_trades else 0:.1f}% | Updates/sec: {self.price_update_count/10:.1f}")
+                self.price_update_count = 0
                 self.last_price_print = now
 
             self.check_positions()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(FullArbitrageBot().run())
+        asyncio.run(FastArbitrageBot().run())
     except KeyboardInterrupt:
         print("\nShutdown complete")

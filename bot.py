@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-HIGH-FREQUENCY ARBITRAGE MACHINE – FIXED FOR 2026
-- Atomic execution (no waiting for targets)
-- Correct fee math (15.5bps total)
-- Sub-millisecond reaction (no sleep)
-- L1 order book data for speed
+ATOMIC ARBITRAGE MACHINE – READY TO DEPLOY
+- Executes trades automatically when spread > 18bps
+- Correct fee math: 15.5bps total (Binance 10 + Bybit 5.5)
+- No sleep – reacts instantly to WebSocket events
+- Shows live prices and executes immediately
 """
 
 import asyncio
@@ -24,7 +24,8 @@ CONFIG = {
     "MIN_SPREAD_BPS": Decimal("18"),             # Must be > 15.5bps total fees
     "BINANCE_FEE_BPS": Decimal("10"),            # 0.1% = 10bps
     "BYBIT_FEE_BPS": Decimal("5.5"),             # 0.055% = 5.5bps
-    "TOTAL_FEES_BPS": Decimal("15.5"),           # 10 + 5.5 = 15.5bps
+    "TOTAL_FEES_BPS": Decimal("15.5"),
+    "COOLDOWN_SEC": 1,                           # Prevent double-trading same symbol
     "BINANCE_SPOT_WS": "wss://stream.binance.com:9443/ws",
     "BYBIT_LINEAR_WS": "wss://stream.bybit.com/v5/public/linear",
 }
@@ -42,6 +43,7 @@ class AtomicArbitrageMachine:
         self.last_trade_time = {}
         self.start_time = time.time()
         self.running = True
+        self.last_price_print = 0
 
     async def binance_handler(self, symbol):
         """Binance Spot – bookTicker stream (fastest L1 data)"""
@@ -78,7 +80,7 @@ class AtomicArbitrageMachine:
                 await asyncio.sleep(1)
 
     async def check_arbitrage(self, symbol):
-        """Atomic arbitrage check – executes immediately when profitable"""
+        """Check and execute arbitrage immediately when profitable"""
         p = self.prices[symbol]
         
         # Check if we have all prices
@@ -86,31 +88,29 @@ class AtomicArbitrageMachine:
             return
         
         # Cooldown check (prevent double trading same symbol too fast)
-        if symbol in self.last_trade_time and time.time() - self.last_trade_time[symbol] < 1:
+        if symbol in self.last_trade_time and time.time() - self.last_trade_time[symbol] < CONFIG["COOLDOWN_SEC"]:
             return
 
         # Opportunity 1: Buy Binance (ask) → Sell Bybit (bid)
-        # Profit = Bybit_bid - Binance_ask - Total_Fees
         spread1_bps = (p["bybit_bid"] - p["binance_ask"]) / p["binance_ask"] * 10000
         
         # Opportunity 2: Buy Bybit (ask) → Sell Binance (bid)
-        # Profit = Binance_bid - Bybit_ask - Total_Fees
         spread2_bps = (p["binance_bid"] - p["bybit_ask"]) / p["bybit_ask"] * 10000
 
         # Execute immediately if profitable
         if spread1_bps > CONFIG["MIN_SPREAD_BPS"]:
-            await self.execute_atomic_arbitrage(
+            await self.execute_trade(
                 symbol, "BUY BINANCE → SELL BYBIT",
                 p["binance_ask"], p["bybit_bid"], spread1_bps
             )
         elif spread2_bps > CONFIG["MIN_SPREAD_BPS"]:
-            await self.execute_atomic_arbitrage(
+            await self.execute_trade(
                 symbol, "BUY BYBIT → SELL BINANCE",
                 p["bybit_ask"], p["binance_bid"], spread2_bps
             )
 
-    async def execute_atomic_arbitrage(self, symbol, direction, buy_price, sell_price, spread_bps):
-        """Execute atomic arbitrage – both legs simultaneously"""
+    async def execute_trade(self, symbol, direction, buy_price, sell_price, spread_bps):
+        """Execute atomic arbitrage trade"""
         order_size = CONFIG["ORDER_SIZE_USDT"]
         
         # Check balance
@@ -134,27 +134,19 @@ class AtomicArbitrageMachine:
         self.total_profit += usd_profit
         self.last_trade_time[symbol] = time.time()
         
-        # Print result
+        # Print execution result
         runtime = (time.time() - self.start_time) / 60
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
         
         print(f"\n{'='*70}")
-        print(f"🚀 ATOMIC ARBITRAGE EXECUTED!")
-        print(f"   📊 Symbol: {symbol.upper()} | Direction: {direction}")
-        print(f"   💰 Buy Price: {buy_price:.8f} | Sell Price: {sell_price:.8f}")
-        print(f"   📈 Gross Spread: {spread_bps:.2f}bps | Fees: {CONFIG['TOTAL_FEES_BPS']}bps")
-        print(f"   💵 Net Profit: +${usd_profit:.5f} ({(net_profit_bps/spread_bps*100):.1f}% of spread)")
-        print(f"   💳 Balance: ${self.balance:.2f} | Total Profit: +${self.total_profit:.5f}")
-        print(f"   📊 Trades: {self.total_trades} | Win Rate: {win_rate:.1f}% | Runtime: {runtime:.1f}min")
+        print(f"💰💰💰 ARBITRAGE EXECUTED! 💰💰💰")
+        print(f"   Symbol: {symbol.upper()} | {direction}")
+        print(f"   Buy: {buy_price:.8f} | Sell: {sell_price:.8f}")
+        print(f"   Gross Spread: {spread_bps:.2f}bps | Fees: {CONFIG['TOTAL_FEES_BPS']}bps")
+        print(f"   Net Profit: +${usd_profit:.5f} ({(net_profit_bps/spread_bps*100):.1f}% of spread)")
+        print(f"   Balance: ${self.balance:.2f} | Total Profit: +${self.total_profit:.5f}")
+        print(f"   Trades: {self.total_trades} | Win Rate: {win_rate:.1f}% | Runtime: {runtime:.1f}min")
         print(f"{'='*70}\n")
-
-    async def stats_printer(self):
-        """Print live stats every 10 seconds (non-blocking)"""
-        while self.running:
-            await asyncio.sleep(10)
-            runtime = (time.time() - self.start_time) / 60
-            win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
-            print(f"\n📊 LIVE STATS | Runtime: {runtime:.1f}min | Balance: ${self.balance:.2f} | Profit: +${self.total_profit:.5f} | Trades: {self.total_trades} | WR: {win_rate:.1f}%\n")
 
     async def run(self):
         # Start WebSocket handlers for all symbols
@@ -162,23 +154,37 @@ class AtomicArbitrageMachine:
         for sym in CONFIG["SYMBOLS"]:
             tasks.append(self.binance_handler(sym))
             tasks.append(self.bybit_handler(sym))
-        tasks.append(self.stats_printer())
         
         print("\n" + "="*70)
-        print("🚀🚀🚀 ATOMIC ARBITRAGE MACHINE – HFT READY 🚀🚀🚀")
+        print("🚀🚀🚀 ATOMIC ARBITRAGE MACHINE – LIVE TRADING 🚀🚀🚀")
         print("="*70)
         print(f"   📊 Min spread required: {CONFIG['MIN_SPREAD_BPS']}bps")
         print(f"   💰 Total fees: {CONFIG['TOTAL_FEES_BPS']}bps (Binance {CONFIG['BINANCE_FEE_BPS']}bps + Bybit {CONFIG['BYBIT_FEE_BPS']}bps)")
         print(f"   💵 Order size: ${CONFIG['ORDER_SIZE_USDT']}")
         print(f"   🎯 Initial balance: ${CONFIG['INITIAL_BALANCE']}")
         print("="*70)
-        print(f"   ⚡ Atomic execution | No sleep | Sub-millisecond reaction")
+        print(f"   ⚡ Atomic execution | No sleep | Instant reaction")
         print("="*70 + "\n")
         
+        print("⏳ Waiting for price data...\n")
+        
+        # Run stats printer in background
+        asyncio.create_task(self.stats_printer())
+        
         await asyncio.gather(*tasks)
+
+    async def stats_printer(self):
+        """Print live stats every 10 seconds"""
+        while self.running:
+            await asyncio.sleep(10)
+            runtime = (time.time() - self.start_time) / 60
+            win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades else 0
+            print(f"\n📊 STATS | Runtime: {runtime:.1f}min | Balance: ${self.balance:.2f} | Profit: +${self.total_profit:.5f} | Trades: {self.total_trades} | WR: {win_rate:.1f}%\n")
 
 if __name__ == "__main__":
     try:
         asyncio.run(AtomicArbitrageMachine().run())
     except KeyboardInterrupt:
         print("\n🔴 Shutdown complete")
+        print(f"💰 Final balance: ${self.balance:.2f}")
+        print(f"💵 Total profit: +${self.total_profit:.5f}")
